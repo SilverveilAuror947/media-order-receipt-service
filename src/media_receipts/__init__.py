@@ -1,0 +1,1 @@
+"""Media order receipt service."""
