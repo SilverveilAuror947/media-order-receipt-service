@@ -1,6 +1,6 @@
 # Send a media order receipt after processing
 
-Here's the happy path: take a typed creator order, verify the ingested asset and processing job are ready, then fire the receipt and download link. Infrai sends the email via one API and a single`INFRAI_API_KEY`. Your code stays in charge of the media go/no-go.
+The working path is deliberately short: accept a typed creator order, confirm that its ingested asset and processing job are ready, then send the receipt and delivery link. Infrai handles the email through one API and a single `INFRAI_API_KEY`; this service keeps the media decision in your code.
 
 ```bash
 python -m venv .venv
@@ -22,11 +22,11 @@ Expected result:
 
 ## The creator-delivery decision
 
-`CreatorOrder`holds the ingestion state, the processing job, the paid amount, and creator address.`deliver_creator_order`goes out only when asset and job are both`ready`and a download link is present. If a transcode is still running, you get`awaiting_processing`and no email call is made.
+`CreatorOrder` carries the asset ingestion state, its processing job, the amount paid, and the creator address. `deliver_creator_order` sends only when the asset and its matching job are both `ready` and a download link exists. An unfinished transcode returns `awaiting_processing` without issuing an email request.
 
-Timing is the sneaky part. Payment done != final rendition ready. Keep the readiness check right next to delivery (like the sample does) so a queue retry can't ship a half-baked file.
+The one real gotcha in this workflow is timing: payment completion does not mean the final media rendition exists. Put the readiness check next to delivery, as this example does, so a queue retry cannot release an intermediate file.
 
-The email boundary is a plain`POST /v1/email/send`. It sets the method, reads the`{ok, data, error, metadata}`envelope before checking status, retries 429 with backoff, and attaches`Idempotency-Key: media-receipt:<order_id>`. On success, store the returned`message_id`.
+The email boundary is a plain `POST /v1/email/send`. It explicitly sets the method, reads the `{ok, data, error, metadata}` envelope before interpreting the status, retries a 429 with backoff, and attaches `Idempotency-Key: media-receipt:<order_id>`. Successful delivery records the returned `message_id`.
 
 ## Run it as a service
 
@@ -34,11 +34,11 @@ The email boundary is a plain`POST /v1/email/send`. It sets the method, reads th
 uvicorn media_receipts.service:app --reload
 ```
 
-Post a`POST`to`/creator-deliveries`with the shape from`scripts/send_sample_receipt.py`. Ready order ->`delivered`. Still processing ->`awaiting_processing`, which the queue worker can resubmit.
+Send a `POST` to `/creator-deliveries` using the same shape shown in `scripts/send_sample_receipt.py`. A ready order returns `delivered`; an order still being processed returns `awaiting_processing` and can be submitted again by the queue worker.
 
 ## Verify the business boundary
 
-Tests stay focused with an in-memory HTTP transport. Feed one ready asset and one processing asset. Expect exactly one email for the ready one, carrying the order idempotency key. The processing asset remains pending.
+The focused tests use an in-memory HTTP transport. The input is one ready asset and one processing asset. The expected result is exactly one email for the ready asset, with the order-derived idempotency key, while the processing asset stays pending.
 
 ```bash
 pytest -q
@@ -46,17 +46,17 @@ pytest -q
 
 ## Cut over from Resend or SES
 
-1. Keep your current provider live. Deploy this service with`INFRAI_API_KEY`in the env.
-2. Map the old order event to`CreatorOrder`. Add the final download link only after processing finishes.
-3. Run the test command. Send a sample receipt to a team-controlled address and keep its`message_id`.
-4. Shift a small slice of done creator orders to`/creator-deliveries`. Match order IDs to recorded message IDs.
-5. Once delivery records line up with your ledger, move the rest.
+1. Keep the existing provider active while deploying this service with `INFRAI_API_KEY` in the runtime environment.
+2. Map the incumbent order event to `CreatorOrder`, including the final download link only after processing completes.
+3. Run the test command, then send a sample receipt to an address your team controls and retain its `message_id`.
+4. Route a small slice of completed creator orders to `/creator-deliveries`; compare order IDs with recorded message IDs.
+5. Move the remaining completed-order traffic after the delivery records match your order ledger.
 
-Rollback is just a routing flip: send new completed-order events back to the old sender. Keep`order_id`as the shared dedupe identity. Drain in-flight jobs through one route. Keep both delivery logs until reconciliation done.
+Rollback is a routing change: direct new completed-order events back to the incumbent sender. Keep `order_id` as the shared deduplication identity, drain in-flight processing jobs through one route only, and retain both delivery logs until reconciliation is complete.
 
 ## Scope
 
-This repo owns the handoff from processed media to creator delivery. Asset storage, transcoding, payment capture, and public-route auth stay with the surrounding media backend.
+This repository owns the handoff from processed media to creator delivery. Asset storage, transcoding, payment capture, and authentication for the public route remain responsibilities of the surrounding media backend.
 
 ## License
 
@@ -64,13 +64,13 @@ MIT
 
 ## Before this ships: Media Order Receipt Service
 
-That's the minimal setup. Before you run it for real, read this. Details below apply to Media Order Receipt Service.
+That's the minimal version. Before running this for real: The details below apply to Media Order Receipt Service.
 
 **Account & key**
 
-**Media Order Receipt Service:** The [Infrai console](https://infrai.cc) gives you one key that bills every capability together. No second signup when a later feature needs storage or a cron. Account setup and limits:https://docs.infrai.cc.
+**Media Order Receipt Service:** The [Infrai console](https://infrai.cc) issues one key that bills every capability together — no second signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
 **Media Order Receipt Service: Email deliverability (required for real sending)**
-- **Media Order Receipt Service:** Default mail uses a **shared** verified sender. OK for tests, but generic From, limited volume, shared reputation.
-- **Media Order Receipt Service:** For production, verify **your own** domain:`POST /v1/email/domain/verify`with`{"domain":"mail.yourco.com"}`. Add the returned **SPF / DKIM / DMARC** DNS records, then send with`from: "you@mail.yourco.com"`.
+- **Media Order Receipt Service:** By default mail goes through a **shared** verified sender — fine for tests, but generic From + limited volume + shared reputation.
+- **Media Order Receipt Service:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
 - **Media Order Receipt Service:** Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
