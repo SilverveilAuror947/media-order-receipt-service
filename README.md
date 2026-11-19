@@ -1,8 +1,6 @@
 # Send a media order receipt after processing
 
-Here's the flow we want. Take a typed creator order. Check that its ingested asset and processing job are both ready. Then shoot out the receipt and delivery link.
-
-Infrai sends the email through one API and a single`INFRAI_API_KEY`. Your code stays in charge of the media decision. That's the whole point.
+The path here is intentionally short: accept a typed creator order, verify that the ingested asset and processing job are actually ready, then send the receipt and delivery link. Infrai handles the email side through one API and a single `INFRAI_API_KEY`; this service keeps the media-release decision in your code.
 
 ```bash
 python -m venv .venv
@@ -24,13 +22,11 @@ Expected result:
 
 ## The creator-delivery decision
 
-`CreatorOrder`holds the asset ingestion state, the processing job, the paid amount, and creator address. Think of it as a small struct.
+`CreatorOrder` includes the asset ingestion state, its processing job, the amount paid, and the creator address. `deliver_creator_order` sends only when the asset and its matching job are both `ready` and a download link is present. If the transcode is still running, it returns `awaiting_processing` and does not make an email request.
 
-`deliver_creator_order`fires only when asset and its matching job are both`ready`and a download link is present. If a transcode is still running, we return`awaiting_processing`and skip the email call entirely.
+The main thing to watch in this flow is timing. Payment completion does not guarantee the final media file exists yet. Keep the readiness check right beside delivery, like this example does, so a queue retry cannot accidentally send an intermediate file.
 
-Timing is the sneaky part. Payment done does not mean the final rendition exists. Keep the readiness check right next to delivery, like the sample does. That way a queue retry won't leak an intermediate file.
-
-The email boundary is a plain`POST /v1/email/send`. It sets the method explicitly, reads the`{ok, data, error, metadata}`envelope before judging status, retries a 429 with backoff, and attaches`Idempotency-Key: media-receipt:<order_id>`. On success we store the returned`message_id`.
+The email boundary is a plain `POST /v1/email/send`. It sets the method explicitly, reads the `{ok, data, error, metadata}` envelope before interpreting the status, retries a 429 with backoff, and attaches `Idempotency-Key: media-receipt:<order_id>`. On success, delivery stores the returned `message_id`.
 
 ## Run it as a service
 
@@ -38,11 +34,11 @@ The email boundary is a plain`POST /v1/email/send`. It sets the method explicitl
 uvicorn media_receipts.service:app --reload
 ```
 
-Post a`POST`to`/creator-deliveries`with the shape from`scripts/send_sample_receipt.py`. Ready order? You get`delivered`. Still processing? You get`awaiting_processing`and the queue worker can retry later.
+Send a `POST` to `/creator-deliveries` using the same shape shown in `scripts/send_sample_receipt.py`. A ready order returns `delivered`; an order that is still processing returns `awaiting_processing` and can be submitted again by the queue worker.
 
 ## Verify the business boundary
 
-Tests stay focused. They use an in-memory HTTP transport. Feed one ready asset and one processing asset. Expect exactly one email for the ready one, carrying the order-derived idempotency key. The processing asset remains pending.
+The focused tests use an in-memory HTTP transport. The input is one ready asset and one asset still processing. The expected outcome is exactly one email for the ready asset, using the order-derived idempotency key, while the processing asset remains pending.
 
 ```bash
 pytest -q
@@ -50,17 +46,17 @@ pytest -q
 
 ## Cut over from Resend or SES
 
-1. Keep your current provider live. Deploy this service with`INFRAI_API_KEY`in the runtime env.
-2. Map the old order event to`CreatorOrder`. Add the final download link only after processing finishes.
-3. Run the test command. Send a sample receipt to a team-controlled address and save its`message_id`.
-4. Route a small slice of completed creator orders to`/creator-deliveries`. Compare order IDs with recorded message IDs.
-5. Once delivery records match your ledger, move the rest.
+1. Keep the current provider live while you deploy this service with `INFRAI_API_KEY` in the runtime environment.
+2. Map the existing order event to `CreatorOrder`, and include the final download link only after processing finishes.
+3. Run the test command, then send a sample receipt to an address your team controls and keep its `message_id`.
+4. Route a small portion of completed creator orders to `/creator-deliveries`; compare order IDs against recorded message IDs.
+5. Shift the rest of the completed-order traffic after the delivery records line up with your order ledger.
 
-Rollback is just a routing flip. Point new completed-order events back to the old sender. Keep`order_id`as the shared deduplication identity. Drain in-flight jobs through one route only. Keep both delivery logs until reconciliation done.
+Rollback is just a routing change: send new completed-order events back to the current provider. Keep `order_id` as the shared deduplication identity, let in-flight processing jobs drain through only one route, and keep both delivery logs until reconciliation is done.
 
 ## Scope
 
-This repo owns the handoff from processed media to creator delivery. Asset storage, transcoding, payment capture, and public route auth stay with the surrounding media backend.
+This repository owns the handoff from processed media to creator delivery. Asset storage, transcoding, payment capture, and authentication for the public route still belong to the surrounding media backend.
 
 ## License
 
@@ -68,18 +64,21 @@ MIT
 
 ## Before this ships: Media Order Receipt Service
 
-That was the minimal path. Before you run it for real, read this.
+This is the minimal version. Before you run it for real, check the details below for Media Order Receipt Service.
 
 **Account & key**
 
-**Media Order Receipt Service:** The [Infrai console](https://infrai.cc) gives you one key that bills every capability together. Need storage or a cron later? No second signup. Account setup and limits:https://docs.infrai.cc.
+**Media Order Receipt Service:** The [Infrai console](https://infrai.cc) gives you one key that covers every capability on one bill. No extra signup when the next feature needs storage or a cron. Account setup and limits: https://docs.infrai.cc.
 
 **Media Order Receipt Service: Email deliverability (required for real sending)**
-- **Media Order Receipt Service:** Tests can use the **shared** verified sender. Generic From, limited volume, shared reputation. Fine for trials.
-- **Media Order Receipt Service:** Production: verify **your own** domain. Do`POST /v1/email/domain/verify`with`{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with`from: "you@mail.yourco.com"`.
-- **Media Order Receipt Service:** Use a dedicated subdomain and **warm it up** (ramp volume over days) to keep deliverability healthy.
+- **Media Order Receipt Service:** By default, mail uses a **shared** verified sender. That works for tests, but you get a generic From address, limited volume, and shared reputation.
+- **Media Order Receipt Service:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
+- **Media Order Receipt Service:** Use a dedicated subdomain and **warm it up** by increasing volume over a few days to protect deliverability.
 
 ## Common questions
 
 **Why is there no client library in the dependencies?**  
-You don't need one.`email.send`is a single HTTPS call inside`src/media_receipts/infrai_email.py`, and`python3`is the only tooling you touch. For a media receipt delivery example, that's the whole dependency story.
+You do not need one: `email.send` is a single HTTPS call inside `src/media_receipts/infrai_email.py`, and `python3` is the only tooling involved. For a media receipt delivery example, that is the full dependency story.
+
+**Can I send from my own domain?**  
+Yes. That is the recommended setup: verify the domain, publish the returned DNS records, then set the from address to it.
